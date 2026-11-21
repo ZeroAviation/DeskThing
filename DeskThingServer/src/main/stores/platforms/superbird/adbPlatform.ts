@@ -342,20 +342,46 @@ export class ADBPlatform extends EventEmitter<PlatformEvents> implements Platfor
     }
 
     this.intervalId = setInterval(async () => {
-      const devices = await this.adbService.getDevices()
-      logger.debug(`Autodetected Devices: ${devices}`, {
-        domain: 'adbPlatform',
-        function: 'restartInterval'
-      })
-
-      // Checking if there are any new devices
-
-      if (devices.length > this.clients.length) {
-        logger.debug(`New devices detected: ${devices.length - this.clients.length}`, {
+      try {
+        const devices = await this.adbService.getDevices()
+        logger.debug(`Autodetected Devices: ${devices}`, {
           domain: 'adbPlatform',
           function: 'restartInterval'
         })
-        await this.refreshDevices()
+
+        const knownDeviceIds = new Set(
+          this.clients
+            .map((client) => client.identifiers[this.id]?.id)
+            .filter((id): id is string => Boolean(id))
+        )
+        const deviceListChanged =
+          devices.length !== knownDeviceIds.size || devices.some((id) => !knownDeviceIds.has(id))
+
+        for (const deviceId of devices) {
+          try {
+            await this.adbService.openPort(deviceId, this.adbPort)
+          } catch (error) {
+            logger.warn(`Failed to refresh reverse tunnel for ${deviceId}`, {
+              error: error as Error,
+              domain: 'adbPlatform',
+              function: 'restartInterval'
+            })
+          }
+        }
+
+        if (deviceListChanged) {
+          logger.debug('ADB device list changed, refreshing devices', {
+            domain: 'adbPlatform',
+            function: 'restartInterval'
+          })
+          await this.refreshDevices()
+        }
+      } catch (error) {
+        logger.warn('Auto-detect refresh failed', {
+          error: error as Error,
+          domain: 'adbPlatform',
+          function: 'restartInterval'
+        })
       }
     }, 30000)
   }
@@ -391,18 +417,22 @@ export class ADBPlatform extends EventEmitter<PlatformEvents> implements Platfor
         }
       })
 
-      // Get the list of new ADB IDs
-      const newAdbIDs = adbDevices.filter((adb) => {
-        return !this.clients.find((client) => client.identifiers[this.id]?.id === adb)
-      })
-
-      // Open the ports one at a time
-      for (const adbId of newAdbIDs) {
-        logger.debug(`Opening port for ${adbId}`)
-        await this.adbService.openPort(adbId, this.adbPort)
+      // Re-assert reverse tunnels for every visible device. ADB drops clear
+      // reverse mappings even when the same serial reconnects.
+      for (const adbId of adbDevices) {
+        try {
+          logger.debug(`Opening port for ${adbId}`)
+          await this.adbService.openPort(adbId, this.adbPort)
+        } catch (error) {
+          logger.warn(`Failed to open port for ${adbId}`, {
+            error: error as Error,
+            function: 'refreshDevices',
+            source: 'adbPlatform'
+          })
+        }
       }
 
-      const progressMultiplier = 1 / adbDevices.length
+      const progressMultiplier = adbDevices.length > 0 ? 1 / adbDevices.length : 1
 
       for (const adbDevice of adbDevices) {
         await this.refreshClient(adbDevice, false, false, progressMultiplier)
@@ -518,7 +548,7 @@ export class ADBPlatform extends EventEmitter<PlatformEvents> implements Platfor
         return updates
       } else {
         // first remove the client if it exists (i.e. if it is a forced refresh)
-        this.clients = this.clients.filter((client) => client.identifiers[this.id]?.id === adbId)
+        this.clients = this.clients.filter((client) => client.identifiers[this.id]?.id !== adbId)
         const newClient: Client = {
           clientId: adbId,
           connectionState: ConnectionState.Established, // not actually connected
